@@ -145,22 +145,99 @@ def append_collapsed_event(event_type, event_details):
         recorded_events.append({"type": event_type, "events": [event_details]})
 
 
-def migrate_flat_schema_to_grouped(flat_events):
-    """Converts old flat JSON schemas to the new grouped/collapsed layout."""
-    grouped = []
-    for event in flat_events:
-        etype = event.get("type")
-        if not etype:
+def normalize_macro_schema(blocks):
+    """Normalize clean, legacy, and accidentally double-wrapped macro schemas."""
+    if not isinstance(blocks, list):
+        return []
+
+    def unwrap_event_items(items):
+        """Flatten wrappers such as {"events": [{...actual event...}]} recursively."""
+        if not isinstance(items, list):
+            return []
+
+        flattened = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            # A prior migration may have wrapped an event one or more extra times.
+            if set(item.keys()) == {"events"} and isinstance(item["events"], list):
+                flattened.extend(unwrap_event_items(item["events"]))
+            else:
+                flattened.append(dict(item))
+        return flattened
+
+    def unwrap_source_fields(block):
+        """Recover source.file/source.count from the old broken events wrapper."""
+        source_block = dict(block)
+
+        if source_block.get("file") or source_block.get("path"):
+            source_block.pop("events", None)
+            return source_block
+
+        wrapped = unwrap_event_items(source_block.get("events", []))
+        if wrapped:
+            payload = wrapped[0]
+            filename = payload.get("file") or payload.get("path")
+            if filename:
+                source_block.pop("events", None)
+                if "file" in payload:
+                    source_block["file"] = payload["file"]
+                else:
+                    source_block["path"] = payload["path"]
+                source_block["count"] = payload.get(
+                    "count", source_block.get("count", 1)
+                )
+        return source_block
+
+    normalized = []
+
+    for block in blocks:
+        if not isinstance(block, dict):
             continue
 
-        # Pull everything except the type field
-        details = {k: v for k, v in event.items() if k != "type"}
+        block_type = block.get("type")
+        if not block_type:
+            continue
 
-        if grouped and grouped[-1]["type"] == etype:
-            grouped[-1]["events"].append(details)
+        if block_type == "source":
+            normalized.append(unwrap_source_fields(block))
+            continue
+
+        if block_type == "repeat":
+            repeat_block = dict(block)
+            repeat_block["events"] = normalize_macro_schema(block.get("events", []))
+            normalized.append(repeat_block)
+            continue
+
+        if isinstance(block.get("events"), list):
+            grouped_block = dict(block)
+            grouped_block["events"] = unwrap_event_items(block["events"])
+
+            if (
+                normalized
+                and normalized[-1].get("type") == block_type
+                and isinstance(normalized[-1].get("events"), list)
+                and normalized[-1].get("type") not in ("source", "repeat")
+            ):
+                normalized[-1]["events"].extend(grouped_block["events"])
+            else:
+                normalized.append(grouped_block)
+            continue
+
+        # Legacy flat standard event: move its details into an events array.
+        details = {k: v for k, v in block.items() if k != "type"}
+        if (
+            normalized
+            and normalized[-1].get("type") == block_type
+            and isinstance(normalized[-1].get("events"), list)
+            and normalized[-1].get("type") not in ("source", "repeat")
+        ):
+            normalized[-1]["events"].append(details)
         else:
-            grouped.append({"type": etype, "events": [details]})
-    return grouped
+            normalized.append({"type": block_type, "events": [details]})
+
+    return normalized
 
 
 def custom_json_dumps(obj, indent_size=2):
@@ -259,13 +336,11 @@ def load_macro_from_file(filepath):
         # Clean up all float representations (including coordinates & delays) recursively
         data = clean_floats(data)
 
-        migrated = False
-        if data and isinstance(data, list) and len(data) > 0:
-            first_elem = data[0]
-            # If 'events' array doesn't exist, migrate it from legacy flat schema
-            if "events" not in first_elem and "type" in first_elem:
-                data = migrate_flat_schema_to_grouped(data)
-                migrated = True
+        # Normalize every block, not just the first one. This preserves source/repeat
+        # control fields while still migrating legacy flat input events.
+        normalized_data = normalize_macro_schema(data)
+        migrated = normalized_data != data
+        data = normalized_data
 
         # Overwrite the file in-place with clean formatting (migrated or already grouped)
         try:
@@ -435,6 +510,9 @@ def execute_block(block, base_dir=None, active_sources=None):
         try:
             with open(filepath, "r") as f:
                 sourced_events = json.load(f)
+
+            # Apply the same schema handling to nested files as to the main macro.
+            sourced_events = normalize_macro_schema(clean_floats(sourced_events))
         except Exception as e:
             send_notification("Macro Engine Error", f"Read error {filename}: {str(e)}")
             return
