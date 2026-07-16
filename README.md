@@ -16,6 +16,18 @@ Rename them as needed for future playback. Choose the playback to use with:
 uv run macro_recorder.py RECORDING_NAME.json
 ```
 
+To source another JSON 3 times:
+
+```json
+[
+  {
+    "type": "source",
+    "file": "another_macro.json",
+    "count": 3
+  }
+]
+```
+
 ## Implementation note
 
 Initially, mouse clicks did not work because they were recorded as

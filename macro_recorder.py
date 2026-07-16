@@ -101,8 +101,31 @@ def repr_to_key(repr_str):
     return KeyCode.from_char(repr_str)
 
 
+def format_sig_figs(val, sig_figs=5):
+    """Formats a float to at most `sig_figs` significant figures."""
+    if not isinstance(val, float):
+        return val
+    if val == 0.0:
+        return 0.0
+    try:
+        return float(f"{val:.{sig_figs}g}")
+    except ValueError:
+        return val
+
+
+def clean_floats(obj):
+    """Recursively traverses Lists and Dicts, reducing all floats to at most 5 sig figs."""
+    if isinstance(obj, float):
+        return format_sig_figs(obj)
+    elif isinstance(obj, dict):
+        return {k: clean_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_floats(x) for x in obj]
+    return obj
+
+
 def get_event_delay():
-    """Calculates the relative delay since the last action."""
+    """Calculates the relative delay since the last action, keeping 5 sig figs."""
     global last_event_time
     now = time.time()
     if last_event_time is None:
@@ -110,11 +133,81 @@ def get_event_delay():
     else:
         delay = now - last_event_time
     last_event_time = now
-    return round(delay, 4)
+    return format_sig_figs(delay)
+
+
+def append_collapsed_event(event_type, event_details):
+    """Appends an event to recorded_events, grouping adjacent items of the same type."""
+    global recorded_events
+    if recorded_events and recorded_events[-1]["type"] == event_type:
+        recorded_events[-1]["events"].append(event_details)
+    else:
+        recorded_events.append({"type": event_type, "events": [event_details]})
+
+
+def migrate_flat_schema_to_grouped(flat_events):
+    """Converts old flat JSON schemas to the new grouped/collapsed layout."""
+    grouped = []
+    for event in flat_events:
+        etype = event.get("type")
+        if not etype:
+            continue
+
+        # Pull everything except the type field
+        details = {k: v for k, v in event.items() if k != "type"}
+
+        if grouped and grouped[-1]["type"] == etype:
+            grouped[-1]["events"].append(details)
+        else:
+            grouped.append({"type": etype, "events": [details]})
+    return grouped
+
+
+def custom_json_dumps(obj, indent_size=2):
+    """Formats JSON so that 'events' items stay on one line, formatting floats to 5 sig figs."""
+
+    def format_val(v, current_indent):
+        next_indent = current_indent + " " * indent_size
+
+        if isinstance(v, float):
+            return json.dumps(format_sig_figs(v))
+
+        elif isinstance(v, list):
+            if not v:
+                return "[]"
+            # See if this is the "events" array containing dictionaries to keep on one line
+            is_events_list = any(isinstance(item, dict) for item in v)
+            if is_events_list:
+                parts = []
+                for item in v:
+                    # Render dict on a single line with space-separated properties
+                    dict_str = ", ".join(
+                        f'"{dk}": {json.dumps(dv)}' for dk, dv in item.items()
+                    )
+                    parts.append(f"{next_indent}{{ {dict_str} }}")
+                return "[\n" + ",\n".join(parts) + f"\n{current_indent}]"
+            else:
+                parts = [format_val(item, next_indent) for item in v]
+                return "[\n" + ",\n".join(parts) + f"\n{current_indent}]"
+
+        elif isinstance(v, dict):
+            if not v:
+                return "{}"
+            # Keep standard formatting with multi-line layout for top-level structures
+            parts = []
+            for dk, dv in v.items():
+                formatted_dv = format_val(dv, next_indent)
+                parts.append(f'{next_indent}"{dk}": {formatted_dv}')
+            return "{\n" + ",\n".join(parts) + f"\n{current_indent}" + "}"
+
+        else:
+            return json.dumps(v)
+
+    return format_val(obj, "")
 
 
 def resolve_playback_source():
-    """Determines what file we read from for loop playback, without setting it for saves."""
+    """Determines what file we read from, processing schemas and migrating old files in-place."""
     global playback_source_file
     if len(sys.argv) > 1:
         target = sys.argv[1]
@@ -140,13 +233,15 @@ def resolve_playback_source():
 
 
 def save_macro_to_file():
-    """Always writes recording to a brand-new timestamped file."""
+    """Always writes recording to a brand-new timestamped file using single-line event formatting."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     timestamped_filename = os.path.join(os.getcwd(), f"macro_{timestamp}.json")
 
     try:
+        cleaned_events = clean_floats(recorded_events)
+        formatted_json = custom_json_dumps(cleaned_events)
         with open(timestamped_filename, "w") as f:
-            json.dump(recorded_events, f, indent=2)
+            f.write(formatted_json)
         send_notification(
             "Macro Engine", f"Saved: {os.path.basename(timestamped_filename)}"
         )
@@ -155,40 +250,75 @@ def save_macro_to_file():
 
 
 def load_macro_from_file(filepath):
-    """Loads relative-timed macro events from a JSON file."""
+    """Loads macro events from a JSON file, formatting and migrating in-place if needed."""
     global recorded_events
     try:
         with open(filepath, "r") as f:
-            recorded_events = json.load(f)
+            data = json.load(f)
+
+        # Clean up all float representations (including coordinates & delays) recursively
+        data = clean_floats(data)
+
+        migrated = False
+        if data and isinstance(data, list) and len(data) > 0:
+            first_elem = data[0]
+            # If 'events' array doesn't exist, migrate it from legacy flat schema
+            if "events" not in first_elem and "type" in first_elem:
+                data = migrate_flat_schema_to_grouped(data)
+                migrated = True
+
+        # Overwrite the file in-place with clean formatting (migrated or already grouped)
+        try:
+            formatted_json = custom_json_dumps(data)
+            with open(filepath, "w") as f:
+                f.write(formatted_json)
+
+            if migrated:
+                send_notification(
+                    "Macro Engine", "Migrated and formatted legacy layout."
+                )
+            else:
+                send_notification("Macro Engine", "Formatted macro file in-place.")
+        except Exception as e:
+            # Fallback output structure safety check
+            send_notification(
+                "Macro Engine Warning", f"Could not format file in-place: {str(e)}"
+            )
+
+        recorded_events = data
         send_notification(
             "Macro Engine",
-            f"Loaded: {os.path.basename(filepath)} ({len(recorded_events)} events)",
+            f"Loaded: {os.path.basename(filepath)} ({len(recorded_events)} event blocks)",
         )
-    except Exception:
-        send_notification("Macro Engine Error", "Failed to resolve file schema.")
+    except Exception as e:
+        send_notification("Macro Engine Error", f"Failed to parse file: {str(e)}")
 
 
 def on_click(x, y, button, pressed):
     if not recording:
         return
-    # Match working implementation: record on initial press for atomic playbacks
     if pressed:
-        recorded_events.append(
+        append_collapsed_event(
+            "mouse_click",
             {
-                "type": "mouse_click",
                 "delay": get_event_delay(),
-                "x": x,
-                "y": y,
+                "x": format_sig_figs(float(x)),
+                "y": format_sig_figs(float(y)),
                 "button": button.name,
-            }
+            },
         )
 
 
 def on_move(x, y):
     if not recording:
         return
-    recorded_events.append(
-        {"type": "mouse_move", "delay": get_event_delay(), "x": x, "y": y}
+    append_collapsed_event(
+        "mouse_move",
+        {
+            "delay": get_event_delay(),
+            "x": format_sig_figs(float(x)),
+            "y": format_sig_figs(float(y)),
+        },
     )
 
 
@@ -210,8 +340,8 @@ def on_press(key):
             return
         pressed_keys.add(key)
 
-        recorded_events.append(
-            {"type": "key_press", "delay": get_event_delay(), "key": key_to_repr(key)}
+        append_collapsed_event(
+            "key_press", {"delay": get_event_delay(), "key": key_to_repr(key)}
         )
 
 
@@ -224,8 +354,8 @@ def on_release(key):
         if key in [keyboard.Key.f1, keyboard.Key.f2, keyboard.Key.esc]:
             return
 
-        recorded_events.append(
-            {"type": "key_release", "delay": get_event_delay(), "key": key_to_repr(key)}
+        append_collapsed_event(
+            "key_release", {"delay": get_event_delay(), "key": key_to_repr(key)}
         )
 
 
@@ -238,9 +368,16 @@ def toggle_recording():
         recording = True
     else:
         recording = False
-        # Remove trailing F1 hotkey releases from the recorded file array
-        while recorded_events and recorded_events[-1].get("key") == "f1":
-            recorded_events.pop()
+        # Remove trailing F1 key releases from the ending group
+        if recorded_events:
+            last_group = recorded_events[-1]
+            if last_group["type"] in ("key_release", "key_press"):
+                last_group["events"] = [
+                    ev for ev in last_group["events"] if ev.get("key") != "f1"
+                ]
+                if not last_group["events"]:
+                    recorded_events.pop()
+
         save_macro_to_file()
 
 
@@ -248,6 +385,104 @@ def stop_playback():
     global playing
     playing = False
     send_notification("Macro Engine", "🛑 Playback aborted.")
+
+
+def execute_block(block, base_dir=None, active_sources=None):
+    """Recursively processes event blocks, supporting nested repeats and sourced files."""
+    global playing
+    if not playing:
+        return
+
+    if active_sources is None:
+        active_sources = set()
+    if base_dir is None:
+        base_dir = os.getcwd()
+
+    block_type = block.get("type")
+
+    # Local block loops
+    if block_type == "repeat":
+        count = block.get("count", 1)
+        sub_events = block.get("events", [])
+        for _ in range(count):
+            for sub_block in sub_events:
+                if not playing:
+                    return
+                execute_block(sub_block, base_dir, active_sources)
+        return
+
+    # Sourced external macro loops
+    if block_type == "source":
+        filename = block.get("file") or block.get("path")
+        if not filename:
+            return
+
+        # Resolve paths relative to the folder containing the currently running file
+        filepath = os.path.abspath(os.path.join(base_dir, filename))
+        count = block.get("count", 1)
+
+        # Recursion and circular dependency guard
+        if filepath in active_sources:
+            send_notification(
+                "Macro Engine Error", f"Circular dependency detected: {filename}"
+            )
+            return
+
+        if not os.path.exists(filepath):
+            send_notification("Macro Engine Error", f"Sourced file missing: {filename}")
+            return
+
+        try:
+            with open(filepath, "r") as f:
+                sourced_events = json.load(f)
+        except Exception as e:
+            send_notification("Macro Engine Error", f"Read error {filename}: {str(e)}")
+            return
+
+        new_active = active_sources | {filepath}
+        sourced_dir = os.path.dirname(filepath)
+
+        for _ in range(count):
+            for sub_block in sourced_events:
+                if not playing:
+                    return
+                execute_block(sub_block, sourced_dir, new_active)
+        return
+
+    # Standard event collection blocks
+    events = block.get("events", [])
+    for event in events:
+        if not playing:
+            break
+
+        if event.get("delay", 0) > 0:
+            time.sleep(event["delay"])
+
+        try:
+            if block_type == "mouse_move":
+                mouse_ctrl.position = (event["x"], event["y"])
+
+            elif block_type == "mouse_click":
+                mouse_ctrl.position = (event["x"], event["y"])
+                time.sleep(0.01)
+
+                btn_name = event["button"]
+                button = (
+                    Button[btn_name] if btn_name in Button.__members__ else Button.left
+                )
+                mouse_ctrl.click(button, 1)
+
+            elif block_type == "key_press":
+                key_obj = repr_to_key(event["key"])
+                keyboard_ctrl.press(key_obj)
+                time.sleep(0.01)
+
+            elif block_type == "key_release":
+                key_obj = repr_to_key(event["key"])
+                keyboard_ctrl.release(key_obj)
+                time.sleep(0.01)
+        except Exception:
+            pass
 
 
 def play_macro():
@@ -262,43 +497,16 @@ def play_macro():
         f"▶️ Looping: {os.path.basename(playback_source_file) if playback_source_file else 'Unsaved Macro'}",
     )
 
+    # Establish the initial base directory of the active execution context
+    base_dir = (
+        os.path.dirname(playback_source_file) if playback_source_file else os.getcwd()
+    )
+
     while playing:
-        for event in recorded_events:
+        for block in recorded_events:
             if not playing:
                 break
-
-            if event["delay"] > 0:
-                time.sleep(event["delay"])
-
-            try:
-                if event["type"] == "mouse_move":
-                    mouse_ctrl.position = (event["x"], event["y"])
-
-                elif event["type"] == "mouse_click":
-                    mouse_ctrl.position = (event["x"], event["y"])
-                    time.sleep(0.01)
-
-                    btn_name = event["button"]
-                    button = (
-                        Button[btn_name]
-                        if btn_name in Button.__members__
-                        else Button.left
-                    )
-
-                    # Fire working atomic, native click
-                    mouse_ctrl.click(button, 1)
-
-                elif event["type"] == "key_press":
-                    key_obj = repr_to_key(event["key"])
-                    keyboard_ctrl.press(key_obj)
-                    time.sleep(0.01)
-
-                elif event["type"] == "key_release":
-                    key_obj = repr_to_key(event["key"])
-                    keyboard_ctrl.release(key_obj)
-                    time.sleep(0.01)
-            except Exception:
-                pass
+            execute_block(block, base_dir=base_dir)
 
         time.sleep(0.5)
 
