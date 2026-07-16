@@ -45,16 +45,3 @@ macOS requires a brief coordinate hover sequence to
 register window focus before it processes a click.
 Keeping at least two to three natural `mouse_move`
 events immediately preceding a click satisfies this OS-level focus hit-test.
-
-While reducing delays makes macros run faster, reducing delays below 3 to
-5 milliseconds between cursor movement and click event execution leads to
-dropped inputs.
-Keeping a minimum delay threshold of 5ms for preserved movements and
-clicks ensures stable input registration while
-maintaining instantaneous execution speeds.
-
-(?) For key-plus-click combinations,
-releasing the key before the click sequence concludes may break click
-mechanics.
-The trigger key should be held down, the cursor moved, the click executed, and
-only then should the key release event be simulated.
